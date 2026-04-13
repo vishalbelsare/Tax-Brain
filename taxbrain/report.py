@@ -1,22 +1,40 @@
 import shutil
+import pandas as pd
 import behresp
 import taxbrain
 import taxcalc as tc
 from pathlib import Path
-from .report_utils import (form_intro, form_baseline_intro, write_text, date,
-                           largest_tax_change, notable_changes,
-                           behavioral_assumptions, consumption_assumptions,
-                           policy_table, convert_table, growth_assumptions,
-                           md_to_pdf, DIFF_TABLE_ROW_NAMES,
-                           dollar_str_formatting)
-
+from .report_utils import (
+    form_intro,
+    form_baseline_intro,
+    write_text,
+    date,
+    largest_tax_change,
+    notable_changes,
+    behavioral_assumptions,
+    consumption_assumptions,
+    policy_table,
+    convert_table,
+    growth_assumptions,
+    md_to_pdf,
+    DIFF_TABLE_ROW_NAMES,
+    dollar_str_formatting,
+)
 
 CUR_PATH = Path(__file__).resolve().parent
 
 
-def report(tb, name=None, change_threshold=0.05, description=None,
-           outdir=None, author="", css=None,
-           verbose=False, clean=False):
+def report(
+    tb,
+    name=None,
+    change_threshold=0.05,
+    description=None,
+    outdir=None,
+    author="",
+    css=None,
+    verbose=False,
+    clean=False,
+):
     """
     Create a PDF report based on TaxBrain results
 
@@ -51,6 +69,7 @@ def report(tb, name=None, change_threshold=0.05, description=None,
         string of bytes for markdown and pdf versions of the report
 
     """
+
     def format_table(df, int_cols, float_cols, float_perc=2):
         """
         Apply formatting to a given table
@@ -72,12 +91,12 @@ def report(tb, name=None, change_threshold=0.05, description=None,
             table of output
         """
         for col in int_cols:
-            df.update(
-                df[col].astype(int).apply("{:,}".format)
-            )
+            df[col] = df[col].astype(int).apply("{:,}".format)
         for col in float_cols:
-            df.update(
-                df[col].astype(float).apply("{:,.{}}".format, args=(float_perc,))
+            df[col] = (
+                df[col]
+                .astype(float)
+                .apply("{:,.{}}".format, args=(float_perc,))
             )
         return df
 
@@ -104,14 +123,14 @@ def report(tb, name=None, change_threshold=0.05, description=None,
         full_filename = Path(output_path, filename)
         plot.savefig(full_filename, dpi=1200, bbox_inches="tight")
 
-        return str(full_filename)
+        return filename
 
     if not tb.has_run:
         tb.run()
     if not name:
         name = f"Policy Report-{date()}"
     if not outdir:
-        outdir = name.replace(" ", "_")
+        outdir = name.replace(" ", "-").replace(",", "")
     if author:
         author = f"Report Prepared by {author.title()}"
     # create directory to hold report contents
@@ -125,7 +144,7 @@ def report(tb, name=None, change_threshold=0.05, description=None,
         "title": name,
         "date": date(),
         "author": author,
-        "taxbrain": str(Path(CUR_PATH, "report_files", "taxbrain.png"))
+        "taxbrain": str(Path(CUR_PATH, "report_files", "taxbrain.png")),
     }
     if tb.stacked:
         stacked_table = tb.stacked_table * 1e-9
@@ -169,18 +188,19 @@ def report(tb, name=None, change_threshold=0.05, description=None,
     # create differences table
     if verbose:
         print("Creating differences table")
-    diff_table = tb.differences_table(
-        tb.start_year, "standard_income_bins", "combined"
-    ).fillna(0)
+    with pd.option_context("future.no_silent_downcasting", True):
+        diff_table = tb.differences_table(
+            tb.start_year, "standard_income_bins", "combined"
+        ).fillna(0)
     diff_table.index = DIFF_TABLE_ROW_NAMES
 
     decile_diff_table = tb.differences_table(
         tb.start_year, "weighted_deciles", "combined"
     ).fillna(0)
     # move the "ALL" row to the bottom of the DataFrame
-    row = decile_diff_table.loc["ALL"].copy()
-    decile_diff_table.drop("ALL", inplace=True)
-    decile_diff_table = decile_diff_table.append(row)
+    target_row = decile_diff_table.loc["ALL", :]
+    decile_diff_table = decile_diff_table.shift(-1)
+    decile_diff_table.iloc[-1] = target_row.squeeze()
 
     # find which income bin sees the largest change in tax liability
     largest_change = largest_tax_change(diff_table)
@@ -188,15 +208,17 @@ def report(tb, name=None, change_threshold=0.05, description=None,
     text_args["largest_change_str"] = largest_change[1]
     decile_diff_table.columns = tc.DIFF_TABLE_LABELS
     # drop certain columns to save space
-    if tc.__version__ >= '3.2.1':
+    if tc.__version__ >= "3.2.1":
         drop_cols = [
-            "Share of Overall Change", "Number of Returns with Tax Cut",
-            "Number of Returns with Tax Increase"
+            "Share of Overall Change",
+            "Number of Returns with Tax Cut",
+            "Number of Returns with Tax Increase",
         ]
     else:
         drop_cols = [
-            "Share of Overall Change", "Count with Tax Cut",
-            "Count with Tax Increase"
+            "Share of Overall Change",
+            "Count with Tax Cut",
+            "Count with Tax Increase",
         ]
     sub_diff_table = decile_diff_table.drop(columns=drop_cols)
 
@@ -254,22 +276,26 @@ def report(tb, name=None, change_threshold=0.05, description=None,
     text_args["model_versions"] = [
         {"name": "Tax-Brain", "release": taxbrain.__version__},
         {"name": "Tax-Calculator", "release": tc.__version__},
-        {"name": "Behavioral-Responses", "release": behresp.__version__}
+        {"name": "Behavioral-Responses", "release": behresp.__version__},
     ]
 
     # create graphs
     if verbose:
         print("Creating graphs")
     dist_graph = taxbrain.distribution_plot(
-        tb, tb.start_year, (5, 4),
-        f"Fig. 2: Percentage Change in After-Tax Income - {tb.start_year}"
+        tb,
+        tb.start_year,
+        (5, 4),
+        f"Fig. 2: Percentage Change in After-Tax Income - {tb.start_year}",
     )
     text_args["distribution_graph"] = export_plot(dist_graph, "dist")
 
     # differences graph
     diff_graph = taxbrain.differences_plot(
-        tb, "combined", (6, 3),
-        title="Fig. 1: Change in Aggregate Combined Tax Liability"
+        tb,
+        "combined",
+        (6, 3),
+        title="Fig. 1: Change in Aggregate Combined Tax Liability",
     )
     text_args["agg_graph"] = export_plot(diff_graph, "difference")
 
@@ -280,7 +306,7 @@ def report(tb, name=None, change_threshold=0.05, description=None,
     report_md = write_text(template_path, **text_args)
 
     # write PDF, markdown files
-    filename = name.replace(" ", "-")
+    filename = name.replace(" ", "-").replace(",", "")
     pdf_path = Path(output_path, f"{filename}.pdf")
     md_path = Path(output_path, f"{filename}.md")
     md_path.write_text(report_md)
@@ -289,10 +315,7 @@ def report(tb, name=None, change_threshold=0.05, description=None,
     if clean:
         # return PDF as bytes and the markdown text
         byte_pdf = pdf_path.read_bytes()
-        files = {
-            f"{filename}.md": report_md,
-            f"{filename}.pdf": byte_pdf
-        }
+        files = {f"{filename}.md": report_md, f"{filename}.pdf": byte_pdf}
         # remove directory where everything was saved
         shutil.rmtree(output_path)
         assert not output_path.exists()

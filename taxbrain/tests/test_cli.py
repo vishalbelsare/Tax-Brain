@@ -9,8 +9,7 @@ def test_cli():
     """
     startyear = 2019
     endyear = 2020
-    data = None
-    usecps = True
+    data = "CPS"
     reform = None
     behavior = None
     assump = None
@@ -20,8 +19,17 @@ def test_cli():
     make_report = False
     author = None
     cli_core(
-        startyear, endyear, data, usecps, reform, behavior, assump, baseline,
-        outdir, name, make_report, author
+        startyear,
+        endyear,
+        data,
+        reform,
+        behavior,
+        assump,
+        baseline,
+        outdir,
+        name,
+        make_report,
+        author,
     )
     outpath = Path(outdir, name)
     # assert that all folders and files have been created

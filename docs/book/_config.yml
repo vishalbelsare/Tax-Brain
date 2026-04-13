@@ -1,15 +1,15 @@
 ####################################################
 # Book settings
 title                    : Tax-Brain
-author                   : Anderson Frailey
-copyright                : '2021'
+author                   : Jason DeBacker and Anderson Frailey
+copyright                : '2024'
 logo                     : '../taxbrain.png'
 
 ####################################################
 # Execution settings
 execute:
-  execute_notebooks      : cache
-  timeout                : 300
+  execute_notebooks      : force
+
 
 ####################################################
 # HTML-specific settings
@@ -34,6 +34,7 @@ binder:
 
 launch_buttons:
   notebook_interface     : 'classic'  # The interface interactive links will activate ["classic", "jupyterlab"]
+  colab_url              : "https://colab.research.google.com"
   # binderhub_url          : https://mybinder.org  # The URL of the BinderHub (e.g., https://mybinder.org)
   # jupyterhub_url         : ""  # The URL of the JupyterHub (e.g., https://datahub.berkeley.edu)
   # thebelab               : false  # Add a thebelab button to pages (requires the repository to run on Binder)
@@ -42,7 +43,7 @@ launch_buttons:
 # Information about where the book exists on the web
 repository:
   url                    : https://github.com/PSLmodels/Tax-Brain
-  path_to_book           : 'book'
+  path_to_book           : 'docs/book'
 
 #######################################################################################
 # Advanced and power-user settings
@@ -51,6 +52,8 @@ sphinx:
                                'sphinx.ext.viewcode', 'sphinx.ext.napoleon',
                                'alabaster']   # A list of extra extensions to load by Sphinx.
   config                    :   # key-value pairs to directly over-ride the Sphinx configuration
+    bibtex_reference_style: author_year
+    mathjax_path          : https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 
 ####################################################
 # LaTeX information

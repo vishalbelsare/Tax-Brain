@@ -1,5 +1,47 @@
 # Tax-Brain Release History
 
+## 2026-04-13 Release 2.8.1
+
+Last Merged Pull Request: [#211](https://github.com/PSLmodels/Tax-Brain/pull/211)
+
+* Compatibility with Tax-Calculator > 6.0.0 and new TMD data: [#211](https://github.com/PSLmodels/Tax-Brain/pull/211)
+
+## 2025-12-23 Release 2.8.0
+
+Last Merged Pull Request: [#209](https://github.com/PSLmodels/Tax-Brain/pull/209)
+
+* Testing on Python 3.13 (drop Python 3.10): [#209](https://github.com/PSLmodels/Tax-Brain/pull/209)
+* Compatibility with Tax-Calculator > 6.0.0: [#206](https://github.com/PSLmodels/Tax-Brain/pull/205)
+
+## 2024-09-23 Release 2.7.2
+
+Last Merged Pull Request: [#205](https://github.com/PSLmodels/Tax-Brain/pull/205)
+
+Changes in this release:
+
+* Minor updates to the documentation: [#204](https://github.com/PSLmodels/Tax-Brain/pull/204) and [#205](https://github.com/PSLmodels/Tax-Brain/pull/205)
+* Testing on Python 3.12: [#205](https://github.com/PSLmodels/Tax-Brain/pull/205)
+
+## 2024-06-10 Release 2.7.1
+
+Last Merged Pull Request: [#202](https://github.com/PSLmodels/Tax-Brain/pull/202)
+
+Changes in this release:
+
+* Use of the [Tax Micro Data (TMD)](https://github.com/PSLmodels/tax-microdata-benchmarking) file: [#202](https://github.com/PSLmodels/Tax-Brain/pull/202)
+
+
+## 2024-04-25 Release 2.7.0
+
+Last Merged Pull Request: [#196](https://github.com/PSLmodels/Tax-Brain/pull/196)
+
+Changes in this release:
+
+* Updates to Compute Studio installation and fixes for new dependencies: [#192](https://github.com/PSLmodels/Tax-Brain/pull/192)
+* Allow distribution of corporate tax incidence: [#196](https://github.com/PSLmodels/Tax-Brain/pull/196)
+* Various documentation updates
+
+
 ## 2021-09-25 Release 2.6.0
 
 Last Merged Pull Request: [#186](https://github.com/PSLmodels/Tax-Brain/pull/186)

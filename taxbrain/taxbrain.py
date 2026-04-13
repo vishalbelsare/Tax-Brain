@@ -2,14 +2,20 @@ import taxcalc as tc
 import pandas as pd
 import numpy as np
 import behresp
-from taxcalc.utils import (DIST_VARIABLES, DIFF_VARIABLES,
-                           create_distribution_table, create_difference_table)
+from taxcalc.utils import (
+    DIST_VARIABLES,
+    DIFF_VARIABLES,
+    create_distribution_table,
+    create_difference_table,
+)
 from dask import compute, delayed
 import dask.multiprocessing
 from collections import defaultdict
 from taxbrain.utils import weighted_sum, update_policy
+from taxbrain.corporate_incidence import distribute as dist_corp
 from typing import Union
 from paramtools import ValidationError
+from pathlib import Path
 
 
 class TaxBrain:
@@ -22,14 +28,28 @@ class TaxBrain:
     # add dictionary to hold version of the various models
     VERSIONS = {
         "Tax-Calculator": tc.__version__,
-        "Behavioral-Responses": behresp.__version__
+        "Behavioral-Responses": behresp.__version__,
     }
 
-    def __init__(self, start_year: int, end_year: int = LAST_BUDGET_YEAR,
-                 microdata: Union[str, dict] = None, use_cps: bool = False,
-                 reform: Union[str, dict] = None, behavior: dict = None,
-                 assump=None, base_policy: Union[str, dict] = None,
-                 verbose=False, stacked=False):
+    # add expected TMD filenames as constants
+    TMD_DATA_FILE = "tmd.csv.gz"
+    TMD_WEIGHTS_FILE = "tmd_weights.csv.gz"
+    TMD_GROWFACTORS_FILE = "tmd_growfactors.csv"
+
+    def __init__(
+        self,
+        start_year: int,
+        end_year: int = LAST_BUDGET_YEAR,
+        microdata: Union[str, dict] = "CPS",
+        reform: Union[str, dict] = None,
+        behavior: dict = None,
+        assump=None,
+        base_policy: Union[str, dict] = None,
+        corp_revenue: Union[dict, list, np.array] = None,
+        corp_incidence_assumptions: dict = None,
+        verbose=False,
+        stacked=False,
+    ):
         """
         Constructor for the TaxBrain class
 
@@ -41,14 +61,12 @@ class TaxBrain:
         end_year: int
             Last year in the analysis. Must be no later than the last
             year allowed in Tax-Calculator.
-        microdata: str or Pandas DataFrame
-            Either a path to a micro-data file or a Pandas DataFrame
-            containing micro-data.
-        use_cps: bool
-            A boolean value to indicate whether or not the analysis should
-            be run using the CPS file included in Tax-Calculator.
-            Note: use_cps cannot be True if a file was also specified with
-            the microdata parameter.
+        microdata: str or dict
+            A string in ["CPS", "PUF", "TMD"] or path to a micro-data
+            file or a Pandas DataFrame, containing micro-data, or a
+            dictionary containing a path to microdata, associated
+            weights, and grow factors.  If a dict, must have keys:
+            "data", "start_year", "growfactors", "weights"
         reform: str or dict
             Individual income tax policy reform. Can be either a string
             pointing to a JSON reform file, or the contents of a JSON file,
@@ -66,22 +84,28 @@ class TaxBrain:
             before the user provided reform is implemented. Can either
             be a string pointing to a JSON reform file, the contents
             of a JSON file, or a properly formatted dictionary.
+        corp_revenue: dict, list, or numpy array
+            A set of corporate revenue estimates for a given set of
+            years.  The estimates much line up with start_year and
+            end_year.
+        corp_incidence_assumptions: dict
+            A dictionary summarizing the assumptions about the
+            distribution of the corporate income tax.  See
+            taxbrain.corporate_incidence.CI_params for an example.
         verbose: bool
             A boolean value indicated whether or not to write model
             progress reports.
         stacked: bool
-            A boolean value indicating wheather the provided reform is in the
+            A boolean value indicating weather the provided reform is in the
             format used for stacked reform analysis
 
         Returns
         -------
         None
         """
-        if not use_cps and microdata is None:
-            raise ValueError("Must specify microdata or set 'use_cps' to True")
-        assert isinstance(start_year, int) & isinstance(end_year, int), (
-            "Start and end years must be integers"
-        )
+        assert isinstance(start_year, int) & isinstance(
+            end_year, int
+        ), "Start and end years must be integers"
         assert start_year <= end_year, (
             f"Specified end year, {end_year}, is before specified start year, "
             f"{start_year}."
@@ -94,12 +118,17 @@ class TaxBrain:
             f"Specified end_year, {end_year}, comes after last known "
             f"budget year, {TaxBrain.LAST_BUDGET_YEAR}."
         )
+        if corp_revenue:
+            assert (
+                len(corp_revenue) == end_year - start_year + 1
+            ), f"Corporate revenue is not given for each budget year"
         self.microdata = microdata
-        self.use_cps = use_cps
         self.start_year = start_year
         self.end_year = end_year
         self.base_data = {yr: {} for yr in range(start_year, end_year + 1)}
         self.reform_data = {yr: {} for yr in range(start_year, end_year + 1)}
+        self.corp_revenue = corp_revenue
+        self.ci_params = corp_incidence_assumptions
         self.verbose = verbose
         self.stacked = stacked
         self.stacked_reforms = None  # only used if stacked is true
@@ -115,8 +144,9 @@ class TaxBrain:
 
         self.has_run = False
 
-    def run(self, varlist: list = DEFAULT_VARIABLES, client=None,
-            num_workers=1):
+    def run(
+        self, varlist: list = DEFAULT_VARIABLES, client=None, num_workers=1
+    ):
         """
         Run the calculators. TaxBrain will determine whether to do a static or
         partial equilibrium run based on the user's inputs when initializing
@@ -146,12 +176,14 @@ class TaxBrain:
                 if self.verbose:
                     print("Running dynamic simulations")
                 self._dynamic_run(
-                    varlist, base_calc, reform_calc, client, num_workers)
+                    varlist, base_calc, reform_calc, client, num_workers
+                )
             else:
                 if self.verbose:
                     print("Running static simulations")
-                self._static_run(varlist, base_calc, reform_calc,
-                                 client, num_workers)
+                self._static_run(
+                    varlist, base_calc, reform_calc, client, num_workers
+                )
             del base_calc, reform_calc
 
         setattr(self, "has_run", True)
@@ -181,13 +213,17 @@ class TaxBrain:
         reform_totals = {}
         differences = {}
         for year in range(self.start_year, self.end_year + 1):
-            base_totals[year] = (self.base_data[year]["s006"] *
-                                 self.base_data[year][var]).sum()
-            reform_totals[year] = (self.reform_data[year]["s006"] *
-                                   self.reform_data[year][var]).sum()
+            base_totals[year] = (
+                self.base_data[year]["s006"] * self.base_data[year][var]
+            ).sum()
+            reform_totals[year] = (
+                self.reform_data[year]["s006"] * self.reform_data[year][var]
+            ).sum()
             differences[year] = reform_totals[year] - base_totals[year]
-        table = pd.DataFrame([base_totals, reform_totals, differences],
-                             index=["Base", "Reform", "Difference"])
+        table = pd.DataFrame(
+            [base_totals, reform_totals, differences],
+            index=["Base", "Reform", "Difference"],
+        )
         if include_total:
             table["Total"] = table.sum(axis=1)
         return table
@@ -229,16 +265,22 @@ class TaxBrain:
         for year in range(self.start_year, self.end_year + 1):
             for var in varlist:
                 data_dict[var] += [weighted_sum(data[year], var)]
-        df = pd.DataFrame(data_dict,
-                          index=range(self.start_year, self.end_year + 1))
+        df = pd.DataFrame(
+            data_dict, index=range(self.start_year, self.end_year + 1)
+        )
         table = df.transpose()
         if include_total:
             table["Total"] = table.sum(axis=1)
         return table
 
-    def distribution_table(self, year: int, groupby: str,
-                           income_measure: str, calc: str,
-                           pop_quantiles: bool = False) -> pd.DataFrame:
+    def distribution_table(
+        self,
+        year: int,
+        groupby: str,
+        income_measure: str,
+        calc: str,
+        pop_quantiles: bool = False,
+    ) -> pd.DataFrame:
         """
         Method to create a distribution table
 
@@ -279,24 +321,26 @@ class TaxBrain:
             data["count"] = data["s006"] * data["XTOT"]
         else:
             data["count"] = data["s006"]
-        data["count_ItemDed"] = data["count"].where(
-            data["c04470"] > 0., 0.
-        )
+        data["count_ItemDed"] = data["count"].where(data["c04470"] > 0.0, 0.0)
         data["count_StandardDed"] = data["count"].where(
-            data["standard"] > 0., 0.
+            data["standard"] > 0.0, 0.0
         )
-        data["count_AMT"] = data["count"].where(
-            data["c09600"] > 0., 0.
-        )
+        data["count_AMT"] = data["count"].where(data["c09600"] > 0.0, 0.0)
         if income_measure == "expanded_income_baseline":
             base_income = self.base_data[year]["expanded_income"]
             data["expanded_income_baseline"] = base_income
-        table = create_distribution_table(data, groupby, income_measure,
-                                          pop_quantiles)
+        table = create_distribution_table(
+            data, groupby, income_measure, pop_quantiles
+        )
         return table
 
-    def differences_table(self, year: int, groupby: str, tax_to_diff: str,
-                          pop_quantiles: bool = False) -> pd.DataFrame:
+    def differences_table(
+        self,
+        year: int,
+        groupby: str,
+        tax_to_diff: str,
+        pop_quantiles: bool = False,
+    ) -> pd.DataFrame:
         """
         Method to create a differences table
 
@@ -321,30 +365,43 @@ class TaxBrain:
         """
         base_data = self.base_data[year]
         reform_data = self.reform_data[year]
-        table = create_difference_table(base_data, reform_data, groupby,
-                                        tax_to_diff, pop_quantiles)
+        table = create_difference_table(
+            base_data, reform_data, groupby, tax_to_diff, pop_quantiles
+        )
         return table
 
     # ----- private methods -----
-    def _taxcalc_advance(self, calc, varlist, year):
-        '''
+    def _taxcalc_advance(self, calc, varlist, year, reform=False):
+        """
         This function advances the year used in Tax-Calculator, computes
         tax liability and rates, and saves the results to a dictionary.
         Args:
-            calc1 (Tax-Calculator Calculator object): TC calculator
+            calc (Tax-Calculator Calculator object): TC calculator
+            varlist (list): variables to return
             year (int): year to begin advancing from
+            reform (bool): whether Calculator object is for the reform policy
+
         Returns:
             tax_dict (dict): a dictionary of microdata with marginal tax
                 rates and other information computed in TC
-        '''
+        """
         calc.advance_to_year(year)
+        if self.corp_revenue is not None:
+            if reform:
+                calc = dist_corp(
+                    calc,
+                    self.corp_revenue,
+                    year,
+                    self.start_year,
+                    self.ci_params,
+                )
         calc.calc_all()
         df = calc.dataframe(varlist)
 
         return df
 
     def _behresp_advance(self, base_calc, reform_calc, varlist, year):
-        '''
+        """
         This function advances the year used in the Behavioral Responses
         model and saves the results to a dictionary.
         Args:
@@ -353,18 +410,28 @@ class TaxBrain:
         Returns:
             tax_dict (dict): a dictionary of microdata with marginal tax
                 rates and other information computed in TC
-        '''
+        """
         base_calc.advance_to_year(year)
         reform_calc.advance_to_year(year)
+        if self.corp_revenue is not None:
+            reform_calc = dist_corp(
+                reform_calc,
+                self.corp_revenue,
+                year,
+                self.start_year,
+                self.ci_params,
+            )
         base, reform = behresp.response(
-            base_calc, reform_calc, self.params["behavior"], dump=True)
+            base_calc, reform_calc, self.params["behavior"], dump=True
+        )
         base_df = base[varlist]
         reform_df = reform[varlist]
 
         return [base_df, reform_df]
 
-    def _static_run(self, varlist, base_calc, reform_calc, client,
-                    num_workers):
+    def _static_run(
+        self, varlist, base_calc, reform_calc, client, num_workers
+    ):
         """
         Run the calculator for a static analysis
         """
@@ -372,17 +439,25 @@ class TaxBrain:
             varlist.append("s006")
         lazy_values = []
         for yr in range(self.start_year, self.end_year + 1):
-            lazy_values.extend([
-                delayed(self._taxcalc_advance(base_calc, varlist, yr)),
-                delayed(self._taxcalc_advance(reform_calc, varlist, yr))
-                ])
+            lazy_values.extend(
+                [
+                    delayed(self._taxcalc_advance(base_calc, varlist, yr)),
+                    delayed(
+                        self._taxcalc_advance(
+                            reform_calc, varlist, yr, reform=True
+                        )
+                    ),
+                ]
+            )
         if client:
             futures = client.compute(lazy_values, num_workers=num_workers)
             results = client.gather(futures)
         else:
             results = results = compute(
-                *lazy_values, scheduler=dask.multiprocessing.get,
-                num_workers=num_workers)
+                *lazy_values,
+                scheduler=dask.multiprocessing.get,
+                num_workers=num_workers,
+            )
 
         # add results to base and reform data
         yr = self.start_year
@@ -393,8 +468,9 @@ class TaxBrain:
 
         del results
 
-    def _dynamic_run(self, varlist, base_calc, reform_calc, client,
-                     num_workers):
+    def _dynamic_run(
+        self, varlist, base_calc, reform_calc, client, num_workers
+    ):
         """
         Run a dynamic response
         """
@@ -402,17 +478,24 @@ class TaxBrain:
             varlist.append("s006")
         lazy_values = []
         for yr in range(self.start_year, self.end_year + 1):
-            lazy_values.extend([
-                delayed(self._behresp_advance(
-                    base_calc, reform_calc, varlist, yr))
-                ])
+            lazy_values.extend(
+                [
+                    delayed(
+                        self._behresp_advance(
+                            base_calc, reform_calc, varlist, yr
+                        )
+                    )
+                ]
+            )
         if client:
             futures = client.compute(lazy_values, num_workers=num_workers)
             results = client.gather(futures)
         else:
             results = results = compute(
-                *lazy_values, scheduler=dask.multiprocessing.get,
-                num_workers=num_workers)
+                *lazy_values,
+                scheduler=dask.multiprocessing.get,
+                num_workers=num_workers,
+            )
 
         # add results to base and reform data
         for i in range(len(results)):
@@ -438,8 +521,9 @@ class TaxBrain:
             results = client.gather(futures)
         else:
             results = results = compute(
-                *lazy_values, scheduler=dask.multiprocessing.get,
-                num_workers=num_workers
+                *lazy_values,
+                scheduler=dask.multiprocessing.get,
+                num_workers=num_workers,
             )
         # add results to data and revenue outputs
         revenue_output["Baseline"] = np.zeros(BW_len)
@@ -464,6 +548,16 @@ class TaxBrain:
             # loop over each year in budget window
             for yr in np.arange(self.start_year, self.end_year + 1):
                 calc.advance_to_year(yr)
+                # change income in accordance with corp income tax
+                # distributed across individual taxpayers
+                if self.corp_revenue is not None:
+                    calc = dist_corp(
+                        calc,
+                        self.corp_revenue,
+                        yr,
+                        self.start_year,
+                        self.ci_params,
+                    )
                 # makes calculations on microdata
                 calc.calc_all()
                 # compute total revenue
@@ -474,17 +568,20 @@ class TaxBrain:
                 if k == reform_list[-1]:
                     self.reform_data[yr] = calc.dataframe(varlist)
         df = pd.DataFrame.from_dict(
-            revenue_output, orient='Index',
-            columns=np.arange(self.start_year, self.start_year + BW_len)
+            revenue_output,
+            orient="Index",
+            columns=np.arange(self.start_year, self.start_year + BW_len),
         )
         # Compute differences from one provision to another
         rev_est_tbl = df.diff()
         # Drop baseline revenue since reporting differences relative to baseline
-        rev_est_tbl.drop(labels='Baseline', inplace=True)
+        rev_est_tbl.drop(labels="Baseline", inplace=True)
 
         # Create totals across budget window
         tot_col = f"{self.start_year}-{self.end_year}"
-        rev_est_tbl[tot_col] = rev_est_tbl[list(rev_est_tbl.columns)].sum(axis=1)
+        rev_est_tbl[tot_col] = rev_est_tbl[list(rev_est_tbl.columns)].sum(
+            axis=1
+        )
         # Create totals across provisions
         rev_est_tbl.loc["Total"] = rev_est_tbl.sum()
 
@@ -495,6 +592,7 @@ class TaxBrain:
         """
         Logic to process user mods and set self.params
         """
+
         def key_validation(actual_keys, required_keys, d_name):
             """
             Validate keys if reform or assump is passed as a dictionary
@@ -565,13 +663,13 @@ class TaxBrain:
                     "'assump' is not a string, dictionary, or None"
                 )
         else:
-            raise TypeError(
-                "'reform' is not a string, dictionary, or None"
-            )
+            raise TypeError("'reform' is not a string, dictionary, or None")
 
         # confirm that all the expected keys are there
-        required_keys = (tc.Calculator.REQUIRED_ASSUMP_KEYS |
-                         tc.Calculator.REQUIRED_REFORM_KEYS)
+        required_keys = (
+            tc.Calculator.REQUIRED_ASSUMP_KEYS
+            | tc.Calculator.REQUIRED_REFORM_KEYS
+        )
         assert set(params.keys()) == required_keys
 
         return params
@@ -582,49 +680,128 @@ class TaxBrain:
         the `run()` method is called
         """
         # Create two microsimulation calculators
+        # Baseline calculator
         gd_base = tc.GrowDiff()
         gf_base = tc.GrowFactors()
         # apply user specified growdiff
         if self.params["growdiff_baseline"]:
             gd_base.update_growdiff(self.params["growdiff_baseline"])
             gd_base.apply_to(gf_base)
-        # Baseline calculator
-        if self.use_cps:
-            records = tc.Records.cps_constructor(data=self.microdata,
-                                                 gfactors=gf_base)
+        if self.microdata == "CPS":
+            records = tc.Records.cps_constructor(data=None, gfactors=gf_base)
+        elif self.microdata == "PUF":
+            records = tc.Records.puf_constructor(
+                data="puf.csv",
+                gfactors=gf_base,
+                # weights=tc.Records.PUF_WEIGHTS_FILENAME,
+            )
+        elif self.microdata == "TMD":
+            gf_base = tc.GrowFactors(self.TMD_GROWFACTORS_FILE)
+            if self.params["growdiff_baseline"]:
+                gd_base.apply_to(gf_base)
+
+            records = tc.Records.tmd_constructor(
+                data_path=Path(self.TMD_DATA_FILE),
+                weights_path=Path(self.TMD_WEIGHTS_FILE),
+                growfactors=gf_base,
+            )
+        elif isinstance(self.microdata, dict):
+            if self.microdata["growfactors"] is None:
+                gd_base = tc.GrowDiff()
+                gf_base = tc.GrowFactors()
+                # apply user specified growdiff
+                if self.params["growdiff_baseline"]:
+                    gd_base.update_growdiff(self.params["growdiff_baseline"])
+                    gd_base.apply_to(gf_base)
+            else:
+                gd_base = tc.GrowDiff()
+                gf_base = tc.GrowFactors(self.microdata["growfactors"])
+                # apply user specified growdiff
+                if self.params["growdiff_baseline"]:
+                    gd_base.update_growdiff(self.params["growdiff_baseline"])
+                    gd_base.apply_to(gf_base)
+            records = tc.Records(
+                self.microdata["data"],
+                start_year=self.microdata["start_year"],
+                gfactors=gf_base,
+                weights=self.microdata["weights"],
+            )
         else:
-            records = tc.Records(self.microdata, gfactors=gf_base)
+            raise ValueError(
+                "microdata must be 'CPS', 'PUF', 'TMD', or a dictionary"
+            )
         policy = tc.Policy(gf_base)
         if self.params["base_policy"]:
             update_policy(policy, self.params["base_policy"])
-        base_calc = tc.Calculator(policy=policy,
-                                  records=records,
-                                  verbose=self.verbose)
+        base_calc = tc.Calculator(
+            policy=policy, records=records, verbose=self.verbose
+        )
 
         # Reform calculator
-        # Initialize a policy object
         gd_reform = tc.GrowDiff()
         gf_reform = tc.GrowFactors()
+        # apply user specified growdiff
         if self.params["growdiff_response"]:
             gd_reform.update_growdiff(self.params["growdiff_response"])
             gd_reform.apply_to(gf_reform)
-        if self.use_cps:
-            records = tc.Records.cps_constructor(data=self.microdata,
-                                                 gfactors=gf_reform)
+        if self.microdata == "CPS":
+            records = tc.Records.cps_constructor(data=None, gfactors=gf_reform)
+        elif self.microdata == "PUF":
+            records = tc.Records.puf_constructor(
+                data="puf.csv",
+                gfactors=gf_reform,
+                # weights=tc.Records.PUF_WEIGHTS_FILENAME,
+            )
+        elif self.microdata == "TMD":
+            gf_reform = tc.GrowFactors(self.TMD_GROWFACTORS_FILE)
+            if self.params["growdiff_response"]:
+                gd_reform.apply_to(gf_reform)
+
+            records = tc.Records.tmd_constructor(
+                data_path=Path(self.TMD_DATA_FILE),
+                weights_path=Path(self.TMD_WEIGHTS_FILE),
+                growfactors=gf_reform,
+            )
+        elif isinstance(self.microdata, dict):
+            if self.microdata["growfactors"] is None:
+                gd_reform = tc.GrowDiff()
+                gf_reform = tc.GrowFactors()
+                # apply user specified growdiff
+                if self.params["growdiff_response"]:
+                    gd_reform.update_growdiff(self.params["growdiff_response"])
+                    gd_reform.apply_to(gf_reform)
+            else:
+                gd_reform = tc.GrowDiff()
+                gf_reform = tc.GrowFactors(self.microdata["growfactors"])
+                # apply user specified growdiff
+                if self.params["growdiff_response"]:
+                    gd_reform.update_growdiff(self.params["growdiff_response"])
+                    gd_reform.apply_to(gf_reform)
+            records = tc.Records(
+                self.microdata["data"],
+                start_year=self.microdata["start_year"],
+                gfactors=gf_reform,
+                weights=self.microdata["weights"],
+            )
         else:
-            records = tc.Records(self.microdata, gfactors=gf_reform)
+            raise ValueError(
+                "microdata must be 'CPS', 'PUF', 'TMD', or a dictionary"
+            )
         policy = tc.Policy(gf_reform)
         if self.params["base_policy"]:
             update_policy(policy, self.params["base_policy"])
         update_policy(policy, self.params["policy"])
 
         # Initialize Calculator
-        reform_calc = tc.Calculator(policy=policy, records=records,
-                                    verbose=self.verbose)
+        reform_calc = tc.Calculator(
+            policy=policy, records=records, verbose=self.verbose
+        )
         # delete all unneeded variables
         del gd_base, gd_reform, records, gf_base, gf_reform, policy
         return base_calc, reform_calc
 
+    # TODO: update these method to allow for different microdata as above
+    # but code becoming cumbersome, so should probably streamline in a single get calculator function
     def _make_stacked_objects(self):
         """
         This method makes the base calculator and policy and records objects
@@ -641,30 +818,107 @@ class TaxBrain:
         if self.params["growdiff_baseline"]:
             gd_base.update_growdiff(self.params["growdiff_baseline"])
             gd_base.apply_to(gf_base)
-        # Baseline calculator
-        if self.use_cps:
-            records = tc.Records.cps_constructor(data=self.microdata,
-                                                 gfactors=gf_base)
+        if self.microdata == "CPS":
+            records = tc.Records.cps_constructor(data=None, gfactors=gf_base)
+        elif self.microdata == "PUF":
+            records = tc.Records.puf_constructor(
+                data="puf.csv",
+                gfactors=gf_base,
+                # weights=tc.Records.PUF_WEIGHTS_FILENAME,
+            )
+        elif self.microdata == "TMD":
+            gf_base = tc.GrowFactors(self.TMD_GROWFACTORS_FILE)
+            if self.params["growdiff_baseline"]:
+                gd_base.apply_to(gf_base)
+
+            records = tc.Records.tmd_constructor(
+                data_path=Path(self.TMD_DATA_FILE),
+                weights_path=Path(self.TMD_WEIGHTS_FILE),
+                growfactors=gf_base,
+            )
+        elif isinstance(self.microdata, dict):
+            if self.microdata["growfactors"] is None:
+                gd_base = tc.GrowDiff()
+                gf_base = tc.GrowFactors()
+                # apply user specified growdiff
+                if self.params["growdiff_baseline"]:
+                    gd_base.update_growdiff(self.params["growdiff_baseline"])
+                    gd_base.apply_to(gf_base)
+            else:
+                gd_base = tc.GrowDiff()
+                gf_base = tc.GrowFactors(self.microdata["growfactors"])
+                # apply user specified growdiff
+                if self.params["growdiff_baseline"]:
+                    gd_base.update_growdiff(self.params["growdiff_baseline"])
+                    gd_base.apply_to(gf_base)
+            records = tc.Records(
+                self.microdata["data"],
+                start_year=self.microdata["start_year"],
+                gfactors=gf_base,
+                weights=self.microdata["weights"],
+            )
         else:
-            records = tc.Records(self.microdata, gfactors=gf_base)
+            raise ValueError(
+                "microdata must be 'CPS', 'PUF', 'TMD', or a dictionary"
+            )
         policy = tc.Policy(gf_base)
         if self.params["base_policy"]:
             update_policy(policy, self.params["base_policy"])
-        base_calc = tc.Calculator(policy=policy,
-                                  records=records,
-                                  verbose=self.verbose)
+        base_calc = tc.Calculator(
+            policy=policy, records=records, verbose=self.verbose
+        )
 
         # Reform calculator
-        # Initialize a policy object
         gd_reform = tc.GrowDiff()
         gf_reform = tc.GrowFactors()
+        # apply user specified growdiff
         if self.params["growdiff_response"]:
             gd_reform.update_growdiff(self.params["growdiff_response"])
             gd_reform.apply_to(gf_reform)
-        if self.use_cps:
-            records = tc.Records.cps_constructor(data=self.microdata,
-                                                 gfactors=gf_reform)
+        if self.microdata == "CPS":
+            reform_records = tc.Records.cps_constructor(
+                data=None, gfactors=gf_reform
+            )
+        elif self.microdata == "PUF":
+            reform_records = tc.Records.puf_constructor(
+                data="puf.csv",
+                gfactors=gf_reform,
+                # weights=tc.Records.PUF_WEIGHTS_FILENAME,
+            )
+        elif self.microdata == "TMD":
+            gf_reform = tc.GrowFactors(self.TMD_GROWFACTORS_FILE)
+            if self.params["growdiff_response"]:
+                gd_reform.apply_to(gf_reform)
+
+            reform_records = tc.Records.tmd_constructor(
+                data_path=Path(self.TMD_DATA_FILE),
+                weights_path=Path(self.TMD_WEIGHTS_FILE),
+                growfactors=gf_reform,
+            )
+        elif isinstance(self.microdata, dict):
+            if self.microdata["growfactors"] is None:
+                gd_reform = tc.GrowDiff()
+                gf_reform = tc.GrowFactors()
+                # apply user specified growdiff
+                if self.params["growdiff_response"]:
+                    gd_reform.update_growdiff(self.params["growdiff_response"])
+                    gd_reform.apply_to(gf_reform)
+            else:
+                gd_reform = tc.GrowDiff()
+                gf_reform = tc.GrowFactors(self.microdata["growfactors"])
+                # apply user specified growdiff
+                if self.params["growdiff_response"]:
+                    gd_reform.update_growdiff(self.params["growdiff_response"])
+                    gd_reform.apply_to(gf_reform)
+            reform_records = tc.Records(
+                self.microdata["data"],
+                start_year=self.microdata["start_year"],
+                gfactors=gf_reform,
+                weights=self.microdata["weights"],
+            )
         else:
-            records = tc.Records(self.microdata, gfactors=gf_reform)
-        policy = tc.Policy(gf_reform)
-        return base_calc, policy, records
+            raise ValueError(
+                "microdata must be 'CPS', 'PUF', 'TMD', or a dictionary"
+            )
+        reform_policy = tc.Policy(gf_reform)
+        return base_calc, reform_policy, reform_records
